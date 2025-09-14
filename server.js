@@ -90,6 +90,12 @@ const FIPS_TO_STATE = {
   "50":"VT","51":"VA","53":"WA","54":"WV","55":"WI","56":"WY","72":"PR"
 };
 
+// Favicon
+app.use('/img', express.static(path.join(__dirname, 'img')));
+app.get('/favicon.ico', (req, res) => {
+  res.sendFile(path.join(__dirname, 'img', 'favicon.ico'));
+});
+
 app.use(cors());
 
 // ---------- Frontend ----------
@@ -100,7 +106,6 @@ app.get('/', (req, res) => {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Representative Lookup (ZIP)</title>
-<link rel="icon" href="data:;base64,iVBORw0KGgo=">
 <style>
   :root{--bg:#f6f8fb;--card:#fff;--muted:#6b7280}
   body{font-family:Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial; background:var(--bg); margin:0; padding:32px; display:flex; justify-content:center}
@@ -129,6 +134,7 @@ app.get('/', (req, res) => {
   .muted{color:var(--muted)}
   @media (max-width:600px){ .results{grid-template-columns:1fr} .avatar{width:56px;height:76px} }
 </style>
+<link rel="icon" type="image/x-icon" href="/favicon.ico">
 </head>
 <body>
   <div class="container">
