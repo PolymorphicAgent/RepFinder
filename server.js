@@ -191,7 +191,7 @@ async function renderZip(zip){
     const parts = [];
     parts.push('<div style="margin-top:12px"><strong>ZIP:</strong> ' + escapeHtml(zip) + (j.centroid ? (' &middot; Lat: '+j.centroid.lat+', Lon: '+j.centroid.lon) : '') + '</div>');
     if (j.districts && j.districts.length > 1) {
-      parts.push('<div class="note">Multiple districts found for this ZIP — showing all matches.</div>');
+      parts.push('<div class="note">Multiple districts found - some results may include nearby districts due to sampling method. Use <a href="https://www.house.gov/representatives/find-your-representative" target="_blank" rel=noopener">the official site</a> to verify!</div>');
     }
     parts.push('<div class="results">');
     for (const rep of reps) {
@@ -259,7 +259,8 @@ app.get('/api/rep', async (req, res) => {
   const zip = zipQuery;
 
   try {
-    // 1) Get lat/lon for ZIP from zippopotam.us
+
+    // Get centroid from zippopotam.us first
     const zipUrl = `https://api.zippopotam.us/us/${zip}`;
     const zipResp = await fetch(zipUrl);
     if (!zipResp.ok) {
@@ -270,89 +271,236 @@ app.get('/api/rep', async (req, res) => {
     if (!place || !place.latitude || !place.longitude) {
       return res.status(502).json({ error: 'Could not get lat/lon from ZIP service' });
     }
+    
     const lat = parseFloat(place.latitude);
     const lon = parseFloat(place.longitude);
-
-    // 2) Use Census geographies/coordinates with lon=x and lat=y to get districts
-    const censusCoordUrl = 'https://geocoding.geo.census.gov/geocoder/geographies/coordinates'
-      + `?x=${encodeURIComponent(lon)}&y=${encodeURIComponent(lat)}&benchmark=Public_AR_Current&vintage=Current_Current&format=json`;
-
-    const geoResp = await fetch(censusCoordUrl);
-    if (!geoResp.ok) return res.status(502).json({ error: 'Census coordinates lookup failed: ' + geoResp.status });
-    const geoJson = await geoResp.json();
-    const geogs = geoJson?.result?.geographies || geoJson?.geographies || geoJson?.result;
-    if (!geogs) return res.status(404).json({ error: 'Census geographies missing' });
-
-    // find the Congressional Districts array defensively
-    let cdArray = null;
-    for (const key of Object.keys(geogs)) {
-      if (key.toLowerCase().includes('congress')) {
-        cdArray = geogs[key];
-        break;
-      }
-    }
-    if (!cdArray || cdArray.length === 0) {
-      cdArray = geogs['Congressional Districts'] || geogs['Congressional District'] || geogs['CongressionalDistricts'] || geogs['Congressional district'];
-    }
-    if (!cdArray || cdArray.length === 0) {
-      return res.status(404).json({ error: 'No Congressional Districts returned by Census for ZIP centroid' });
-    }
-
-    // Build set of keys
-    const foundKeys = new Set();
-    for (const cd of cdArray) {
-      let districtNum = null;
-      for (const k of Object.keys(cd)) {
-        if (/^CD\d{1,3}$/i.test(k) && cd[k]) { districtNum = String(parseInt(cd[k], 10)); break; }
-        if (k.toLowerCase().includes('name') && cd[k] && /district/i.test(cd[k])) {
-          const m = String(cd[k]).match(/(\d+)\s*$/);
-          if (m) { districtNum = String(parseInt(m[1],10)); break; }
+    
+    // Sample multiple points in a much wider grid to catch all district boundaries  
+    const offsets = [
+      // Center point
+      [0, 0],
+      
+      // Dense close grid (~0.5-1.5km)
+      [0.005, 0], [-0.005, 0], [0, 0.005], [0, -0.005],
+      [0.01, 0], [-0.01, 0], [0, 0.01], [0, -0.01],
+      [0.007, 0.007], [-0.007, -0.007], [0.007, -0.007], [-0.007, 0.007],
+      [0.012, 0.012], [-0.012, -0.012], [0.012, -0.012], [-0.012, 0.012],
+      
+      // Medium grid (~1.5-2.5km)
+      [0.015, 0], [-0.015, 0], [0, 0.015], [0, -0.015],
+      [0.02, 0], [-0.02, 0], [0, 0.02], [0, -0.02],
+      [0.018, 0.018], [-0.018, -0.018], [0.018, -0.018], [-0.018, 0.018],
+      
+      // Wide grid (~2.5-3.5km) - to catch distant parts of ZIP
+      [0.025, 0], [-0.025, 0], [0, 0.025], [0, -0.025],
+      [0.03, 0], [-0.03, 0], [0, 0.03], [0, -0.03],
+      [0.022, 0.022], [-0.022, -0.022], [0.022, -0.022], [-0.022, 0.022],
+      
+      // Extra wide grid (~3.5-4.5km) - for very spread out ZIPs
+      [0.035, 0], [-0.035, 0], [0, 0.035], [0, -0.035],
+      [0.04, 0], [-0.04, 0], [0, 0.04], [0, -0.04],
+      [0.028, 0.028], [-0.028, -0.028], [0.028, -0.028], [-0.028, 0.028],
+      
+      // Very wide scattered points (~5km+) for large/complex ZIPs
+      [0.045, 0], [-0.045, 0], [0, 0.045], [0, -0.045],
+      [0.035, 0.035], [-0.035, -0.035], [0.035, -0.035], [-0.035, 0.035]
+    ];
+    
+    const pointResults = [];
+    
+    console.log(`ZIP ${zip}: Sampling ${offsets.length} points around centroid (${lat}, ${lon}) in parallel`);
+    
+    // Create all promises at once
+    const pointPromises = offsets.map(async ([latOffset, lonOffset], i) => {
+      const testLat = lat + latOffset;
+      const testLon = lon + lonOffset;
+      
+      try {
+        const censusCoordUrl = `https://geocoding.geo.census.gov/geocoder/geographies/coordinates?x=${encodeURIComponent(testLon)}&y=${encodeURIComponent(testLat)}&benchmark=Public_AR_Current&vintage=Current_Current&format=json`;
+    
+        const geoResp = await fetch(censusCoordUrl);
+        if (!geoResp.ok) {
+          console.warn(`Point ${i+1}: Census API error ${geoResp.status}`);
+          return null;
         }
+        
+        const geoJson = await geoResp.json();
+        const geogs = geoJson?.result?.geographies;
+        
+        if (!geogs) return null;
+        
+        // Find Congressional Districts
+        for (const key of Object.keys(geogs)) {
+          if (key.toLowerCase().includes('congress')) {
+            const districts = geogs[key] || [];
+            for (const cd of districts) {
+              let districtNum = null;
+              
+              // Parse district number
+              for (const k of Object.keys(cd)) {
+                if (/^CD\d{1,3}$/i.test(k) && cd[k]) {
+                  districtNum = String(parseInt(cd[k], 10));
+                  break;
+                }
+              }
+              
+              if (!districtNum && cd.NAME) {
+                const m = String(cd.NAME).match(/(\d+)/);
+                if (m) districtNum = String(parseInt(m[1], 10));
+              }
+              
+              const stateFipsRaw = cd.STATE || cd.STATEFP || (cd.GEOID && String(cd.GEOID).slice(0,2));
+              const stateFips = stateFipsRaw ? String(stateFipsRaw).padStart(2,'0') : null;
+              const state = stateFips ? (FIPS_TO_STATE[stateFips] || null) : null;
+              
+              if (state && districtNum) {
+                if (districtNum === '0') districtNum = '1';
+                const districtKey = `${state}-${districtNum}`;
+                const distance = Math.sqrt(latOffset*latOffset + lonOffset*lonOffset) * 111;
+                
+                return {
+                  point: i+1,
+                  coords: [testLat, testLon],
+                  district: districtKey,
+                  distance: distance
+                };
+              }
+            }
+            break;
+          }
+        }
+      } catch (err) {
+        console.warn(`Point ${i+1}: Error:`, err.message);
       }
-      if (!districtNum && cd.NAME) {
-        const m = String(cd.NAME).match(/(\d+)\s*$/);
-        if (m) districtNum = String(parseInt(m[1],10));
+      return null;
+    });
+    
+    // Wait for all requests to complete
+    const results = await Promise.all(pointPromises);
+    
+    // Process results
+    const foundDistricts = new Set();
+    results.forEach(result => {
+      if (result) {
+        const isNew = !foundDistricts.has(result.district);
+        foundDistricts.add(result.district);
+        pointResults.push(result);
+        console.log(`Point ${result.point}${isNew ? ' 🆕' : ''}: Found district ${result.district} [~${result.distance.toFixed(1)}km from center]`);
       }
-      const stateFipsRaw = cd.STATE || cd.STATEFP || (cd.GEOID && String(cd.GEOID).slice(0,2));
-      const stateFips = stateFipsRaw ? String(stateFipsRaw).padStart(2,'0') : null;
-      const state = stateFips ? (FIPS_TO_STATE[stateFips] || null) : null;
-      if (!state) continue;
-      if (!districtNum || districtNum === '0') districtNum = '1';
-      foundKeys.add(`${state}-${districtNum}`);
-    }
+    });
+    
+    console.log(`ZIP ${zip}: Found ${foundDistricts.size} unique districts:`, Array.from(foundDistricts));
+    // foundKeys = foundDistricts;
 
-    if (foundKeys.size === 0) return res.status(404).json({ error: 'No congressional districts found for ZIP centroid', zip });
+    // After we have foundKeys (the Set of districts), validate each one
+    console.log(`ZIP ${zip}: Validating ${foundDistricts.size} districts found through sampling...`);
+    
+    const validatedDistricts = new Set();
+    
+    try {
+      // Use the ZIP centroid coordinates we already have to get the "official" districts
+      const validateUrl = `https://geocoding.geo.census.gov/geocoder/geographies/coordinates?x=${encodeURIComponent(lon)}&y=${encodeURIComponent(lat)}&benchmark=Public_AR_Current&vintage=Current_Current&format=json`;
+      
+      const validateResp = await fetch(validateUrl);
+      if (validateResp.ok) {
+        const validateJson = await validateResp.json();
+        const geogs = validateJson?.result?.geographies || {};
+        
+        // Get districts from the ZIP centroid
+        const centroidDistricts = new Set();
+        for (const key of Object.keys(geogs)) {
+          if (key.toLowerCase().includes('congress')) {
+            const districts = geogs[key] || [];
+            for (const cd of districts) {
+              let districtNum = null;
+              for (const k of Object.keys(cd)) {
+                if (/^CD\d{1,3}$/i.test(k) && cd[k]) {
+                  districtNum = String(parseInt(cd[k], 10));
+                  break;
+                }
+              }
+              
+              if (!districtNum && cd.NAME) {
+                const m = String(cd.NAME).match(/(\d+)/);
+                if (m) districtNum = String(parseInt(m[1], 10));
+              }
+              
+              const stateFips = cd.STATE || cd.STATEFP || (cd.GEOID && String(cd.GEOID).slice(0,2));
+              const state = stateFips ? (FIPS_TO_STATE[String(stateFips).padStart(2,'0')] || null) : null;
+              
+              if (state && districtNum) {
+                if (districtNum === '0') districtNum = '1';
+                centroidDistricts.add(`${state}-${districtNum}`);
+              }
+            }
+            break;
+          }
+        }
+        
+        console.log(`ZIP ${zip}: ZIP centroid is in districts:`, Array.from(centroidDistricts));
+        
+        // Validate: Keep the centroid district(s) plus any neighboring districts found through sampling
+        // This handles both single-district ZIPs and multi-district ZIPs
+        foundDistricts.forEach(districtKey => {
+          if (centroidDistricts.has(districtKey)) {
+            validatedDistricts.add(districtKey);
+            console.log(`ZIP ${zip}: ✅ Confirmed district ${districtKey} (contains ZIP centroid)`);
+          } else {
+            // For multi-district ZIPs, also include nearby districts found through sampling
+            // But be more conservative - only if we found multiple districts total
+            if (foundDistricts.size > 1 && centroidDistricts.size >= 1) {
+              validatedDistricts.add(districtKey);
+              console.log(`ZIP ${zip}: ✅ Including district ${districtKey} (nearby district in multi-district ZIP)`);
+            } else {
+              console.log(`ZIP ${zip}: ❌ Excluding district ${districtKey} (likely false positive - ZIP centroid not in this district)`);
+            }
+          }
+        });
+        
+      } else {
+        console.warn(`ZIP ${zip}: Validation failed, keeping all districts found`);
+        foundDistricts.forEach(d => validatedDistricts.add(d));
+      }
+      
+    } catch (err) {
+      console.warn(`ZIP ${zip}: Error during validation:`, err.message);
+      // If validation fails, keep all districts (benefit of the doubt)
+      foundDistricts.forEach(d => validatedDistricts.add(d));
+    }
+    
+    console.log(`ZIP ${zip}: Final validated districts:`, Array.from(validatedDistricts));
+    const foundKeys = validatedDistricts;
 
     // Lookup each district in local INDEX
     const reps = [];
-for (const k of Array.from(foundKeys)) {
-  const rep = INDEX[k];
-  const [st, dnum] = k.split('-');
-  if (rep) {
-    // Build bioguide photoURL
-    let photo = null;
-    if (rep.bioguide) {
-        photo = "https://bioguide.congress.gov/photo/"+rep.bioguide+".jpg";
+    for (const k of Array.from(foundKeys)) {
+      const rep = INDEX[k];
+      const [st, dnum] = k.split('-');
+      if (rep) {
+        // Build bioguide photoURL
+        let photo = null;
+        if (rep.bioguide) {
+            photo = "https://bioguide.congress.gov/photo/"+rep.bioguide+".jpg";
+        }
+    
+        reps.push({
+          state: st,
+          district: dnum,
+          name: rep.name,
+          party: rep.party,
+          phone: rep.phone,
+          url: rep.url,
+          bioguide: rep.bioguide,
+          photo,
+          raw_person: rep.raw_person,
+          raw_term: rep.raw_term
+        });
+      } else {
+        reps.push({ state: st, district: dnum, name: null, missing: true });
+      }
     }
-
-    reps.push({
-      state: st,
-      district: dnum,
-      name: rep.name,
-      party: rep.party,
-      phone: rep.phone,
-      url: rep.url,
-      bioguide: rep.bioguide,
-      photo,
-      raw_person: rep.raw_person,
-      raw_term: rep.raw_term
-    });
-  } else {
-    reps.push({ state: st, district: dnum, name: null, missing: true });
-  }
-}
-
-return res.json({ zip, centroid: { lat, lon }, districts: Array.from(foundKeys), representatives: reps });
+    
+    return res.json({ zip, centroid: { lat, lon }, districts: Array.from(foundKeys), representatives: reps });
 
   } catch (err) {
     console.error('ZIP lookup error', err);
