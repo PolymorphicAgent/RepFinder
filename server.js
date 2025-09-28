@@ -173,7 +173,7 @@ async function renderZip(zip){
     const r = await fetch('/api/rep?zip=' + encodeURIComponent(zip));
     if (!r.ok) {
       const text = await r.text();
-      resultArea.innerHTML = '<p class="note" style="color:crimson">Error: ' + r.status + ' ' + escapeHtml(text) + '</p>';
+      resultArea.innerHTML = '<p class="note" style="color:crimson">Error: ' + r.status + ' Invalid Zip Code' + '</p>';
       return;
     }
     const j = await r.json();
